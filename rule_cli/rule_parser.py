@@ -74,6 +74,13 @@ class Node:
             if c.is_terminal_node():
                 return True
         return False
+
+    def terminate(self):
+        for c in self.child_nodes:
+            if c.is_terminal_node():
+                c.result = "__terminate__"
+                return
+        assert False, "Node %s cannot terminate" % self.name
         
     def is_optional(self):
         return self.optional
@@ -108,20 +115,57 @@ class Node:
                 break
         return None if node_names else node
 
-    def terminate_paths(self):
+    def collect_paths(self):
+        assert self.is_terminal_node()
+        paths = []
+        node = self.parent_node
+        root = self.get_root()
+        while node:
+            if not paths:
+                paths.append([node])
+            else:
+                for p in paths:
+                    p.append(node)
+            if node.is_optional():
+                assert node.is_keyword()
+                # Duplicate current paths and delete itself from the copy
+                binding = root.value_binding(node.keyword())
+                copy_paths = []
+                for p in paths:
+                    p2 = p.copy()
+                    p2.pop()
+                    if binding:
+                        assert p2[-1].is_value()
+                        p2.pop()
+                    copy_paths.append(p2)
+                paths.extend(copy_paths)
+            node = node.parent_node
+        for p in paths:
+            p.reverse()
+        return paths
+        
+    def terminate_paths(self, collect_terminal_nodes=None):
         for c in self.child_nodes:
             if c.is_terminal_node():
+                if collect_terminal_nodes is not None:
+                    collect_terminal_nodes.append(c)
                 continue
             if c.is_leaf():
-                c.child_nodes.append(TerminalNode())
+                if c.child_nodes:
+                    if collect_terminal_nodes:
+                        collect_terminal_nodes.append(c.child_nodes[0])
+                else:
+                    terminal_node = TerminalNode()
+                    c.child_nodes.append(terminal_node)
+                    terminal_node.parent_node = c
+                    if collect_terminal_nodes is not None:
+                        collect_terminal_nodes.append(terminal_node)
             else:
-                c.terminate_paths()
+                c.terminate_paths(collect_terminal_nodes)
 
     def clear_result(self):
         self.result = None
         for c in self.child_nodes:
-            if c.is_terminal_node():
-                continue
             c.clear_result()
 
     def print_node(self, indent=0):
@@ -233,10 +277,13 @@ class Node:
     def evaluate(self, tokens):
         assert self.is_root()
         self.clear_result()
+        assert tokens[0] == self.keyword()
         r = self.walk(tokens, 1)
         if not r:
             self.clear_result()
             return None
+        self.result = self.keyword()
+        # Collect bindings
         values = { "__tokens__" : tokens }
         node = self
         while node:
@@ -247,8 +294,6 @@ class Node:
             if node.is_leaf():
                 break
             for c in node.child_nodes:
-                if c.is_terminal_node():
-                    continue
                 if c.result is not None:
                     node = c
                     break
@@ -258,10 +303,13 @@ class Node:
     def walk(self, tokens, pos):
         token = tokens[pos]
         for c in self.child_nodes:
+            if c.is_terminal_node():
+                continue
             if c.consume(token):
                 if len(tokens) == pos + 1:
                     # All tokens consumed. Abandon if c cannot terminate command
                     if c.may_terminate():
+                        c.terminate()
                         return True
                 elif c.is_leaf():
                     # more tokens but no child node to walk
@@ -326,8 +374,21 @@ class Command(Keyword):
         return self.context is not None
 
     def check_paths(self):
-        self.terminate_paths()
-
+        collect_terminal_nodes = []
+        self.terminate_paths(collect_terminal_nodes)
+        # Collect all potential paths and check if any conflict
+        all_paths = []
+        for node in collect_terminal_nodes:
+            paths = node.collect_paths()
+            all_paths.extend(paths)
+        print("Total number of paths %d" % len(all_paths))
+        all_path_strs = set([])
+        for p in all_paths:
+            s = "/".join("%s" % n.name for n in p)
+            if s in all_path_strs:
+                raise PathException("Duplicate path found %s" % s)
+            all_path_strs.add(s)
+            
     def print_commands(self):
         self.print_node()
         
@@ -442,7 +503,7 @@ class Context:
         if self.nest_context:
             self.nest_context.exit_context(commit=False)
             self.nest_context = None
-        return self.commands[cmd][1](self, values)
+        return self.commands[cmd][1](self, tokens, values)
 
 # ================================
 # RunTime

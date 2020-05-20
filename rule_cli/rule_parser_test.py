@@ -26,7 +26,7 @@ value_node.next_keyword_is("end_cmd")
 
 value_node.next_arg_is(
     "cmd9", rangeValue, help_string="Cmd2 help", optional=True).\
-    next_keyword_is("cmd4", help_string="End at cmd4")
+    next_keyword_is("cmd41", help_string="End at cmd41")
 
 rangeValue2 = IntRange("range2", 10, 20, help_string="Range2 help")
 value_node.next_args_are([("cmd4", "Cmd4 help"),
@@ -44,9 +44,9 @@ cmd, _ = my_context.get_command("my_cmd")
 cmd.print_commands()
 
 run_time = RunTime("runtime", my_context)
-run_time.evaluate_command("my_cmd cmd1 2")
-run_time.evaluate_command("my_cmd cmd2 cmd3")
-run_time.evaluate_command("my_cmd cmd2")
-run_time.evaluate_command("my_cmd cmd1 2 end_cmd")
-run_time.evaluate_command("my_cmd cmd1 2 cmd3 10 cmd4")
-run_time.evaluate_command("my_cmd cmd1 2 cmd4")
+#run_time.evaluate_command("my_cmd cmd1 2")
+#run_time.evaluate_command("my_cmd cmd2 cmd3")
+#run_time.evaluate_command("my_cmd cmd2")
+#run_time.evaluate_command("my_cmd cmd1 2 end_cmd")
+run_time.evaluate_command("my_cmd cmd1 2 cmd9 10 cmd41")
+#run_time.evaluate_command("my_cmd cmd1 2 cmd4")
