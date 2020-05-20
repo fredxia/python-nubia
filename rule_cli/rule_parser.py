@@ -1,7 +1,19 @@
 
 import re
+import sys
 import shlex
 import pdb
+import traceback
+
+def isInteractive(fh):
+    return fh.isatty() and not fh.closed
+
+def exceptionHook(ex, val, tr):
+    traceback.print_exception(ex, val, tr)
+    if isInteractive(sys.stderr) and isInteractive(sys.stdout):
+        pdb.post_mortem(tr)
+
+sys.excepthook = exceptionHook
 
 # ================================
 # Exception
@@ -21,17 +33,12 @@ class CommandException(Exception):
 # ================================
 
 class Node:
-    def __init__(self, name, help_string=None, optional=None):
+    def __init__(self, name, help_string=None, optional=False):
         self.name = name
         self.help_string = help_string
         self.parent_node = None
         self.child_nodes = []
         self.optional = optional
-        # Only for root node
-        self.keyword_value_binding = None
-        self.context = None
-        self.discard_trailing_tokens = False
-        # Save resolved value during walk
         self.result = None
 
     def is_root(self):
@@ -62,21 +69,14 @@ class Node:
         return False
         # pylint: enable=R0201
 
+    def may_terminate(self):
+        for c in self.child_nodes:
+            if c.is_terminal_node():
+                return True
+        return False
+        
     def is_optional(self):
         return self.optional
-
-    def is_registered(self):
-        assert self.is_root()
-        return self.context is not None
-
-    def get_context(self):
-        assert self.is_root()
-        return self.context
-
-    def set_context(self, context, discard_trailing_tokens=False):
-        assert self.is_root()
-        self.context = context
-        self.discard_trailing_tokens = discard_trailing_tokens
 
     def keyword(self):
         assert self.is_keyword()
@@ -88,16 +88,19 @@ class Node:
         return self.parent_node.path_string() + "/" + self.name
 
     def get_path(self, path_string):
-        assert self.is_root()
         node_names = path_string.split("/")
+        assert self.is_root() and node_names[0] == self.name
         node = self
+        node_names.pop(0)
+        if not node_names:
+            return self
         while node_names:
             found = False
             name = node_names.pop(0)
             for c in node.child_nodes:
                 if c.is_terminal_node():
                     continue
-                if c.name() == name:
+                if c.name == name:
                     node = c
                     found = True
                     break
@@ -121,24 +124,25 @@ class Node:
                 continue
             c.clear_result()
 
-    def print_commands(self):
-        assert self.is_root()
-        self.print_node()
-
     def print_node(self, indent=0):
+        node_str = " " * indent
         if self.is_keyword():
-            if self.get_root().keyword_value_binding[self.keyword()]:
+            binding = self.get_root().value_binding(self.keyword())
+            if binding is True:
                 value = self.value_child()
-                print("%s%s <%s>" % (
-                    " " * indent, self.keyword(), value.name()))
-                if value.is_terminal_node():
-                    print("%s<cr>" % " " * (indent + 4))
+                s = "%s <%s>" % (self.keyword(), value.name)
+                if value.may_terminate():
+                    s += " <cr>"
+                node_str += s if not self.is_optional() else "[" + s + "]"
+                print(node_str)
                 if not value.is_leaf():
                     value.print_node(indent + 4)
             else:
-                print("%s%s" % (" " * indent, self.keyword()))
-                if self.is_terminal_node():
-                    print("%s<cr>" % " " * (indent + 4))
+                s = self.keyword()
+                if self.may_terminate():
+                    s += " <cr>"
+                node_str += s if not self.is_optional() else "[" + s + "]"                    
+                print(node_str)
                 for c in self.child_nodes:
                     if c.is_terminal_node():
                         continue
@@ -151,24 +155,22 @@ class Node:
 
     def value_child(self):
         assert self.is_keyword() and \
-            self.get_root().keyword_value_binding[self.keyword()] is True
+            self.get_root().value_binding(self.keyword()) is True
         for c in self.child_nodes:
             if c.is_value():
                 return c
         raise PathException("value child not found")
 
-    def can_terminate_command(self):
-        for c in self.child_nodes:
-            if c.is_terminal_node():
-                return True
-        return False
-
     def next_args_are(self, args, optional=False):
         for arg in args:
-            self.next_arg_is(arg[0], help_string=arg[1], optional=optional)
+            if len(arg) == 2:
+                self.next_keyword_is(arg[0], help_string=arg[1], optional=optional)
+            else:
+                assert len(arg) == 3 and arg[2].is_value()
+                self.next_arg_is(arg[0], arg[2], help_string=arg[1],
+                                 optional=optional)
 
-    def next_arg_is(self, keyword, help_string=None, value=None,
-                    optional=False):
+    def next_arg_is(self, keyword, value, help_string=None, optional=False):
 
         assert isinstance(keyword, str)
         assert not self.is_terminal_node()
@@ -181,15 +183,16 @@ class Node:
         root = self.get_root()
         assert not root.is_registered()
 
+        binding = root.value_binding(keyword)
         if self.is_value():
-            if keyword in root.keyword_binding:
-                if root.keyword_value_binding[keyword] is True:
+            if binding is not None:
+                if binding is True:
                     if not value:
                         raise PathException("%s is a value key" % keyword)
                 elif value:
                     raise PathException("%s canont be a value key" % keyword)
         else:
-            if root.keyword_value_binding[self.keyword()] is True:
+            if root.value_binding(self.keyword()) is True:
                 raise PathException(
                     "%s is value key. Cannot have more chld node" % (
                         self.path_string()))
@@ -203,10 +206,6 @@ class Node:
             if c.keyword() == keyword:
                 raise PathException("%s already defined in %s" % (
                     keyword, self.path_string()))
-            # All must be optional if there are multiple children
-            if not c.is_optional() or not optional:
-                raise PathException("Cannot add %s to non-optional sibling" % (
-                    keyword))
 
         # Terminate all other child nodes if not yet
         for c in self.child_nodes:
@@ -222,12 +221,15 @@ class Node:
 
         self.child_nodes.append(keyword_node)
         keyword_node.parent_node = self
-        if not keyword in root.keyword_value_binding:
-            root.keyword_value_binding[keyword] = value is not None
+        if binding is None:
+            root.set_value_binding(keyword, value is not None)
 
         return keyword_node if not value else value
 
-
+    def next_keyword_is(self, keyword, help_string=None, optional=False):
+        return self.next_arg_is(keyword, None, help_string=help_string,
+                                optional=optional)
+        
     def evaluate(self, tokens):
         assert self.is_root()
         self.clear_result()
@@ -241,7 +243,7 @@ class Node:
             if node.result is None:
                 continue
             if node.is_value():
-                values[node.name()] = node.result
+                values[node.name] = node.result
             if node.is_leaf():
                 break
             for c in node.child_nodes:
@@ -259,7 +261,7 @@ class Node:
             if c.consume(token):
                 if len(tokens) == pos + 1:
                     # All tokens consumed. Abandon if c cannot terminate command
-                    if c.can_terminate_command():
+                    if c.may_terminate():
                         return True
                 elif c.is_leaf():
                     # more tokens but no child node to walk
@@ -284,8 +286,8 @@ class TerminalNode(Node):
         return True
 
 class Keyword(Node):
-    def __init__(self, keyword, help_string, **kwargs):
-        Node.__init__(self, keyword, help_string, kwargs)
+    def __init__(self, keyword, help_string=None, optional=False):
+        Node.__init__(self, keyword, help_string, optional=optional)
 
     def is_keyword(self):
         return True
@@ -296,16 +298,49 @@ class Keyword(Node):
             return True
         return False
 
+class Command(Keyword):
+    def __init__(self, keyword, help_string=None):
+        Keyword.__init__(self, keyword, help_string=help_string)
+        # Command keyword always followed by a keyword
+        self.keyword_value_binding = { keyword : False }
+        self.context = None
+        self.discard_trailing_tokens = False
+
+    def value_binding(self, keyword):
+        if not keyword in self.keyword_value_binding:
+            return None
+        return self.keyword_value_binding[keyword]
+
+    def set_value_binding(self, keyword, is_value):
+        assert keyword not in self.keyword_value_binding
+        self.keyword_value_binding[keyword] = is_value
+
+    def get_context(self):
+        return self.context
+
+    def set_context(self, context, discard_trailing_tokens=False):
+        self.context = context
+        self.discard_trailing_tokens = discard_trailing_tokens
+
+    def is_registered(self):
+        return self.context is not None
+
+    def check_paths(self):
+        self.terminate_paths()
+
+    def print_commands(self):
+        self.print_node()
+        
 class Value(Node):
-    def __init__(self, name, help_string, **kwargs):
-        Node.__init__(self, name, help_string, kwargs)
+    def __init__(self, name, help_string=None):
+        Node.__init__(self, name, help_string)
 
     def is_value(self):
         return True
 
 class IntValue(Value):
-    def __init_(self, name, help_string, **kwargs):
-        super().__init__(self, name, help_string, **kwargs)
+    def __init_(self, name, help_string=None):
+        super().__init__(self, name, help_string)
 
     def consume(self, a_str):
         try:
@@ -316,8 +351,8 @@ class IntValue(Value):
             return False
 
 class IntRange(Value):
-    def __init__(self, name, help_string, low, high, **kwargs):
-        super().__init__(name, help_string, **kwargs)
+    def __init__(self, name, low, high, help_string=None):
+        super().__init__(name, help_string)
         self.low = int(low)
         self.high = int(high)
 
@@ -361,9 +396,9 @@ class Context:
         keyword = cmd_node.keyword()
         if keyword in self.commands:
             raise PathException("Command %s exists in context %s" % (
-                keyword, self.name()))
+                keyword, self.name))
 
-        cmd_node.terminate_paths()
+        cmd_node.check_paths()
         cmd_node.set_context(
             self, discard_trailing_tokens=discard_trailing_tokens)
         self.commands[keyword] = (cmd_node, handler)
