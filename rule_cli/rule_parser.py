@@ -68,20 +68,24 @@ class TokenNode:
     def __init__(self, name, help_string=None, optional=False):
         self.name = name
         self.help_string = help_string
-        self.ingress = []
-        self.egress = []
+        self.prev_tokens = []
+        self.next_tokens = []
         self.flags = TokenNode.Flag_Optional if optional else 0
         self.result = None # hold resolved value during parsing
 
     def is_root(self):
-        return not self.ingress
+        return not self.prev_tokens
 
     def get_root(self):
-        return self if not self.ingress else self.ingress[0].get_root()
+        return self if self.is_root() else self.prev_tokens[0].get_root()
 
+    def get_command(self):
+        root = self.get_root()
+        return root if isinstance(root, Command) else None
+        
     def is_leaf(self):
-        return not self.egress or \
-            (len(self.egress) == 1 and self.egress[0].is_terminal_node())
+        return not self.next_tokens or \
+            (len(self.next_tokens) == 1 and self.next_tokens[0].is_terminal_node())
 
     def is_optional(self):
         return self.flags & TokenNode.Flag_Optional != 0
@@ -105,13 +109,12 @@ class TokenNode:
         # pylint: enable=R0201
 
     def may_terminate(self):
-        for c in self.egress:
-            if c.is_terminal_node():
-                return True
-        return False
+        if not self.get_command():
+            return False
+        return self in self.get_command().terminal_node.prev_tokens
 
     def terminate(self):
-        for c in self.egress:
+        for c in self.next_tokens:
             if c.is_terminal_node():
                 c.result = "__terminate__"
                 return
@@ -123,33 +126,34 @@ class TokenNode:
 
     def path_string(self):
         '''String of one possible path'''
-        if not self.ingress:
+        if not self.prev_tokens:
             return self.name
-        return self.ingress[0].path_string() + "/" + self.name
+        return self.prev_tokens[0].path_string() + "/" + self.name
 
     def terminate_paths(self):
         if self.is_terminal_node():
             return
-        command = self.get_root()
-        for c in self.egress:
+        command = self.get_command()
+        assert command is not None, "Node is not in a command %s" % self.name
+        for c in self.next_tokens:
             if c.is_terminal_node():
                 continue
             if c.is_leaf():
-                if not c.egress:
-                    c.egress.append(command.terminal_node)
-                    command.terminal_node.ingress.append(c)
+                if not c.next_tokens:
+                    c.next_tokens.append(command.terminal_node)
+                    command.terminal_node.prev_tokens.append(c)
             else:
                 c.terminate_paths()
 
     def clear_result(self):
         self.result = None
-        for c in self.egress:
+        for c in self.next_tokens:
             c.clear_result()
 
     def dump_node(self, indent=0):
         node_str = " " * indent
         if self.is_keyword():
-            binding = self.get_root().value_binding(self.keyword())
+            binding = self.get_command().value_binding(self.keyword())
             if binding is True:
                 value = self.value_child()
                 s = "%s <%s>" % (self.keyword(), value.name)
@@ -165,20 +169,20 @@ class TokenNode:
                     s += " <cr>"
                 node_str += s if not self.is_optional() else "[" + s + "]"
                 print(node_str)
-                for c in self.egress:
+                for c in self.next_tokens:
                     if c.is_terminal_node():
                         continue
                     c.print_node(indent + 4)
         else:
-            for c in self.egress:
+            for c in self.next_tokens:
                 if c.is_terminal_node():
                     continue
                 c.print_node(indent + 4)
 
     def value_child(self):
         assert self.is_keyword() and \
-            self.get_root().value_binding(self.keyword()) is True
-        for c in self.egress:
+            self.get_command().value_binding(self.keyword()) is True
+        for c in self.next_tokens:
             if c.is_value():
                 return c
         raise PathException("value child not found")
@@ -187,11 +191,11 @@ class TokenNode:
 
         if value_node:
             # Must be a freshly created value node
-            assert not value_node.ingress and not value_node.egress
+            assert not value_node.prev_tokens and not value_node.next_tokens
 
         # Registered command is frozen and cannot accept new args
-        command = self.get_root()
-        assert not command.is_registered()
+        command = self.get_command()
+        assert command and not command.is_registered()
 
         has_binding = command.value_binding(keyword)
         if has_binding is not None:
@@ -204,7 +208,7 @@ class TokenNode:
                         keyword))
 
         # Terminate all other child nodes if not yet
-        for c in self.egress:
+        for c in self.next_tokens:
             if c.is_terminal_node():
                 continue
             assert c.is_keyword()
@@ -229,11 +233,11 @@ class TokenNode:
         keyword_node = Keyword(keyword, help_string=help_string,
                                optional=optional)
         if value_node:
-            keyword_node.egress.append(value_node)
-            value_node.ingress = [keyword_node]
+            keyword_node.next_tokens.append(value_node)
+            value_node.prev_tokens = [keyword_node]
 
-        self.egress.append(keyword_node)
-        keyword_node.ingress = [self]
+        self.next_tokens.append(keyword_node)
+        keyword_node.prev_tokens = [self]
         if has_binding is None:
             command.set_value_binding(keyword, value_node is not None)
         return keyword_node if not value_node else value_node
@@ -257,7 +261,7 @@ class TokenNode:
             self.next_is("cmd_keyword", "keyword help", value_node, optional=True)
             self.next_is("cmd_keyword", "<value>", optional=True)
             self.next_is("cmd_keyword", "keyword help", "<value>", optional=True)
-            self.next_is(cmd_keyword_node, optional=True)
+            self.next_is(cmd_keyword_node)
             self.next_is(cmd_keyword_node, "<value>", optional=True)
             self.next_is(cmd_keyword_node, value_node, optional=True)
         '''
@@ -267,8 +271,11 @@ class TokenNode:
         keyword = args[0]
         keyword_help = None
         value = None
+        optional = False
 
-        command = self.get_root()
+        command = self.get_command()
+        if not command:
+            raise PathException("Node is not in a command: %s" % self.name)
 
         if isinstance(keyword, Keyword):
             if len(args) == 2:
@@ -279,8 +286,9 @@ class TokenNode:
                     assert value, "Value %s not found" % args[1]
             else:
                 assert len(args) == 1
-            keyword = keyword.keyword()
             keyword_help = keyword.help_string
+            optional = keyword.is_optional() # node may have optional set
+            keyword = keyword.keyword()
         elif len(args) == 1:
             pass
         elif len(args) == 2:
@@ -293,10 +301,10 @@ class TokenNode:
         else:
             keyword_help = args[1]
             if isinstance(args[2], str):
-                value = command.get_registered_value(args[2])
+                value = get_value_of_token(command.context_name, args[2])
                 assert value, "Value %s not found" % args[2]
 
-        optional = kwargs.get("optional", False) if kwargs else False
+        optional = kwargs.get("optional", optional)
         return self.next_is_internal(keyword, keyword_help, value, optional)
 
     def evaluate(self, tokens):
@@ -322,7 +330,7 @@ class TokenNode:
                 values[node.name] = node.result
             if node.is_leaf():
                 break
-            for c in node.egress:
+            for c in node.next_tokens:
                 if c.result is not None:
                     node = c
                     break
@@ -336,7 +344,7 @@ class TokenNode:
         all tokens.
         '''
         token = tokens[pos]
-        for c in self.egress:
+        for c in self.next_tokens:
             if c.is_terminal_node():
                 continue
             if c.consume(token):
@@ -347,7 +355,7 @@ class TokenNode:
                         return True
                 elif c.is_leaf():
                     # more tokens but no child node to walk
-                    if self.get_root().discard_trailing_tokens:
+                    if self.get_command().discard_trailing_tokens:
                         return True
                     raise PathException("Unmatched trailing tokens: %s" % (
                         tokens[1:]))
@@ -419,8 +427,7 @@ class Command(Keyword):
 
     def __init__(self, keyword, help_string=None, context=None):
         Keyword.__init__(self, keyword, help_string=help_string)
-        # Command keyword always followed by a keyword
-        self.keyword_value_binding = { keyword : False }
+        self.keyword_value_binding = {}
         self.discard_trailing_tokens = False
         self.context_name = context if context else global_context_name
         self.all_paths = None
@@ -448,10 +455,16 @@ class Command(Keyword):
         while node_names:
             found = False
             name = node_names.pop(0)
-            for c in node.egress:
+            for c in node.next_tokens:
                 if c.name == name:
+                    if c.is_value():
+                        print("Warning: match value with node name %s" % name)
                     node = c
                     found = True
+                elif c.is_value() and c.value_name() == name:
+                    node = c
+                    found = True
+                if found:
                     break
             if not found:
                 break
@@ -462,43 +475,62 @@ class Command(Keyword):
         all_paths = set([])
         def dfs_walk(node, path):
             if node.is_leaf():
-                path_str = " ".join(path)
+                path_str = " ".join([p.keyword() if p.is_keyword() \
+                                     else p.value_name() for p in path])
                 assert path_str not in all_paths
                 all_paths.add(path_str)
             else:
-                for e in node.egress:
+                for e in node.next_tokens:
                     if e.is_terminal_node():
                         continue
-                    token = e.keyword() if e.is_keyword() else e.value_name()
-                    if token in path:
+                    if e in path:
                         raise PathException(
                             "Command %s arg cycle detected at %s" % (
-                                self.name, token))
-                    path.append(token)
+                                self.name, e.name))
+                    path.append(e)
                     dfs_walk(e, path)
                     path.pop(-1)
 
-        path = [self.name]
+        path = [self]
         dfs_walk(self, path)
         return all_paths
 
     def check_paths(self):
 
+        def promote_nodes(from_nodes, to_nodes):
+            for from_node in from_nodes:
+                for to_node in to_nodes:
+                    if from_node not in to_node.next_tokens:
+                        assert to_node not in from_node.prev_tokens
+                        to_node.next_tokens.append(from_node)
+                        from_node.prev_tokens.append(to_node)
+                        from_node.flags |= TokenNode.Flag_Promoted
+                        
         def terminate_and_promote(node):
             if node.is_leaf():
-                if not node.egress:
-                    node.egress.append(self.terminal_node)
+                if not node.next_tokens:
+                    node.next_tokens.append(self.terminal_node)
                 return
-            for e in node.egress:
+            for e in node.next_tokens:
                 if not e.is_terminal_node():
-                    terminate_and_promote(e)
+                    terminate_and_promote(e) # DFS
             if node.is_keyword() and node.is_optional():
-                # promote egress nodes one level up
-                for enode in node.egress:
-                    for inode in node.ingress:
-                        if not enode in inode.ingress:
-                            inode.ingress.append(enode)
-                            enode.flags |= TokenNode.Flag_Promoted
+                # need to promote
+                has_binding = self.value_binding(node)
+                if has_binding:
+                    from_nodes = node.value_child().next_tokens
+                else:
+                    from_nodes = node.next_tokens
+                # to nodes may be immediate up level or two level up if the
+                # up level node is a value node
+                to_nodes = []
+                for prev in node.prev_tokens:
+                    if prev.is_keyword():
+                        to_nodes.append(prev)
+                    else:
+                        assert prev.is_value() and prev.prev_tokens[0].is_keyword()
+                        to_nodes.append(prev.prev_tokens[0])
+                promote_nodes(from_nodes, to_nodes)
 
         terminate_and_promote(self)
         self.all_paths = self.collect_paths()
@@ -517,33 +549,33 @@ class Command(Keyword):
 
         # Verify node chain is a chain
         new_node = new_node_chain
-        while new_node.egress:
-            if not len(new_node.egress) == 1:
+        while new_node.next_tokens:
+            if not len(new_node.next_tokens) == 1:
                 raise PathException(
                     "Command node chain is not a single-link chain %s" % (
                         new_node.name))
-            new_node = new_node.egress[0]
+            new_node = new_node.next_tokens[0]
 
         def is_kv_node(node):
             return node.is_keyword() and not node.is_leaf() and \
-                node.egress[0].is_value()
+                node.next_tokens[0].is_value()
 
-        new_node = new_node_chain.egress[0]
+        new_node = new_node_chain.next_tokens[0]
         current_node = self
 
         while new_node:
             if is_kv_node(new_node):
                 # Add both the keyword and value nodes
                 node = current_node.next_is(new_node,
-                                            new_node.egress[0],
+                                            new_node.next_tokens[0],
                                             optional=new_node.is_optional(),
                                             merge=True)
                 if not node:
                     return None
                 current_node = node
-                if new_node.egress[0].is_leaf():
+                if new_node.next_tokens[0].is_leaf():
                     break # end of node chain
-                new_node = new_node.egress[0].egress[0]
+                new_node = new_node.next_tokens[0].next_tokens[0]
             else:
                 node = current_node.next_is(new_node,
                                             optional=new_node.is_optional(),
@@ -551,12 +583,12 @@ class Command(Keyword):
                 if not node:
                     return None
                 current_node = node
-                if not new_node.egress:
+                if not new_node.next_tokens:
                     break # end of node chain
-                new_node = new_node.egress[0]
+                new_node = new_node.next_tokens[0]
         return current_node
 
-    def dump_commands(self):
+    def print_commands(self):
         for p in self.all_paths:
             print(p)
 
@@ -595,20 +627,34 @@ def get_keyword_help_string(context_name, keyword):
     return registered_keywords[context_name].get(keyword, None)
 
 def register_value_token(*args):
+    '''
+        register_value_token(value_node)    
+        register_value_token("context_name", value_node)
+
+        Save a copy of a clean value node.
+    '''
     context_name = args[0] if len(args) == 2 else global_context_name
     value_node = args[0] if len(args) == 1 else args[1]
     assert isinstance(value_node, ValueNode)
+    node = copy.deepcopy(value_node)
+    node.prev_tokens = []
+    node.next_tokens = []
     if context_name not in registered_values:
-        registered_values[context_name] = { value_node.name : value_node }
+        registered_values[context_name] = { node.name : node }
         return
-    assert value_node.name not in registered_values[context_name]
-    registered_values[context_name][value_node.name] = value_node
+    assert node.name not in registered_values[context_name]
+    registered_values[context_name][node.name] = node
 
 def get_value_of_token(context_name, token):
-    if context_name in registered_values:
-        if token in registered_values[context_name]:
-            return registered_values[context_name][token]
-    return registered_values[global_context_name].get(token, None)
+    '''Return a copy of registered value node so it can be used freely'''
+    if token.startswith("<"):
+        token = token.strip("<").rstrip(">")
+    if context_name in registered_values and \
+       token in registered_values[context_name]:
+        return copy.deepcopy(registered_values[context_name][token])
+    if token in registered_values[global_context_name]:
+        return copy.deepcopy(registered_values[global_context_name][token])
+    return None
 
 def parse_cmd_spec_string(context_name, cmd_str):
     '''
@@ -619,7 +665,7 @@ def parse_cmd_spec_string(context_name, cmd_str):
     cmd = tokens.pop(0)
     if not is_keyword_str(cmd):
         raise ParseException("Invalid command string %s" % cmd)
-    if cmd in registered_commands[context_name]:
+    if get_registered_command(context_name, cmd):
         raise ParseException("Command already registered %s in context %s" % (
             cmd, context_name))
 
@@ -633,7 +679,7 @@ def parse_cmd_spec_string(context_name, cmd_str):
             keyword_node = Keyword(token,
                                    get_keyword_help_string(context_name, token),
                                    optional=optional)
-            if not tokens or not is_value_token(token[0]):
+            if not tokens or not is_value_token(tokens[0]):
                 node = node.next_is(keyword_node)
             elif is_value_token(tokens[0]):
                 token = tokens.pop(0)
@@ -646,11 +692,22 @@ def parse_cmd_spec_string(context_name, cmd_str):
         elif token == "[":
             if optional:
                 raise ParseException("Unbalanced optional bracket")
+            pdb.set_trace()
             optional = True
         elif token == "]":
             if not optional:
                 raise ParseException("Unbalanced optional bracket")
             optional = False
+        elif node == cmd_node:
+            # special case. cmd itself followed by value
+            value_node = get_value_of_token(context_name, token)
+            if value_node:
+                cmd_node.next_tokens.append(value_node)
+                value_node.prev_tokens.append(cmd_node)
+                node = value_node
+                cmd_node.set_value_binding(cmd, True)
+            else:
+                raise ParseException("Parse error at %s" % token)
         else:
             assert False, "Parse error at %s" % token
     if optional:
@@ -669,8 +726,9 @@ def register_command_node(cmd_node, context_name, handler):
             keyword, context_name))
 
     cmd_node.check_paths()
+    
     cmd_node.context_name = context_name
-    registered_commands[context_name] = (cmd_node, handler)
+    registered_commands[context_name][cmd_node.name] = (cmd_node, handler)
     return cmd_node
 
 def register_command(*args):
@@ -694,26 +752,59 @@ def register_command(*args):
     '''
     assert len(args) > 0 and len(args) < 4
 
+    if isinstance(args[0], Command):
+        cmd_node = args[0]
+        if len(args) == 1:
+            context_name = cmd_node.context_name if cmd_node.context_name \
+                           else global_context_name
+            return register_command_node(cmd_node,
+                                         context_name,
+                                         default_command_handler)
+        if len(args) == 2:
+            if isinstance(args[1], str):
+                context_name = args[1]
+                if cmd_node.context_name and \
+                   cmd_node.context_name != context_name:
+                    raise PathException(
+                        "Conflict in command %s context %s, %s" % (
+                            cmd_node.name, cmd_node.context_name, context_name))
+                return register_command_node(cmd_node,
+                                             context_name,
+                                             default_command_handler)
+            # args[1] is handler
+            context_name = cmd_node.context_name if cmd_node.context_name \
+                           else global_context_name
+            return register_command_node(cmd_node, context_name, args[1])
+        if len(args) == 3:
+            assert isinstance(args[1], str)
+            if cmd_node.context_name and cmd_node.context_name != args[1]:
+                raise PathException(
+                    "Conflict in command %s context %s, %s" % (
+                        cmd_node.name, cmd_node.context_name, args[1]))
+            return register_command_node(cmd_node, args[1], args[2])
+
     if len(args) == 1:
+        if isinstance(args[0], str):
+            return register_command([args[0]],
+                                    global_context_name,
+                                    default_command_handler)
         return register_command(args[0],
                                 global_context_name,
                                 default_command_handler)
     if len(args) == 2:
         if isinstance(args[1], str):
-            return register_command(args[0], args[1], default_command_handler)
+            return register_command([args[0]], args[1], default_command_handler)
         return register_command(args[0], global_context_name, args[1])
 
     # len(args) == 3
     if isinstance(args[0], str):
         return register_command([args[0]], args[1], args[2])
-    if isinstance(args[0], Command):
-        return register_command_node(args[0], args[1], args[2])
 
+    # len(args) == 3 and register list of command specs
     assert isinstance(args[0], list)
 
     new_commands = {}
-    context_name = args[1] if len(args) == 3 else global_context_name
-    handler = args[1] if len(args) == 2 else args[2]
+    context_name, handler = args[1], args[2]
 
     for cmd_str in args[0]:
         new_cmd_node = parse_cmd_spec_string(context_name, cmd_str)
@@ -726,7 +817,7 @@ def register_command(*args):
             new_commands[new_cmd_node.name] = new_cmd_node
     nodes = []
     for cmd_node in new_commands.values():
-        n = register_command(cmd_node, context_name, handler)
+        n = register_command_node(cmd_node, context_name, handler)
         nodes.append(n)
     return nodes
 
