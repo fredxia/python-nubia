@@ -434,9 +434,9 @@ class Command(Keyword):
         self.terminal_node = TerminalNode()
 
     def value_binding(self, keyword):
-        if not keyword in self.keyword_value_binding:
-            return None
-        return self.keyword_value_binding[keyword]
+        if isinstance(keyword, Keyword):
+            keyword = keyword.name
+        return self.keyword_value_binding.get(keyword, None)
 
     def set_value_binding(self, keyword, is_value):
         assert keyword not in self.keyword_value_binding
@@ -502,6 +502,8 @@ class Command(Keyword):
                 for to_node in to_nodes:
                     if from_node not in to_node.next_tokens:
                         assert to_node not in from_node.prev_tokens
+                        print("promote %s to %s" % (
+                            from_node.name, to_node.name))
                         to_node.next_tokens.append(from_node)
                         from_node.prev_tokens.append(to_node)
                         from_node.flags |= TokenNode.Flag_Promoted
@@ -515,22 +517,12 @@ class Command(Keyword):
                 if not e.is_terminal_node():
                     terminate_and_promote(e) # DFS
             if node.is_keyword() and node.is_optional():
-                # need to promote
                 has_binding = self.value_binding(node)
                 if has_binding:
                     from_nodes = node.value_child().next_tokens
                 else:
                     from_nodes = node.next_tokens
-                # to nodes may be immediate up level or two level up if the
-                # up level node is a value node
-                to_nodes = []
-                for prev in node.prev_tokens:
-                    if prev.is_keyword():
-                        to_nodes.append(prev)
-                    else:
-                        assert prev.is_value() and prev.prev_tokens[0].is_keyword()
-                        to_nodes.append(prev.prev_tokens[0])
-                promote_nodes(from_nodes, to_nodes)
+                promote_nodes(from_nodes, node.prev_tokens)
 
         terminate_and_promote(self)
         self.all_paths = self.collect_paths()
@@ -692,7 +684,6 @@ def parse_cmd_spec_string(context_name, cmd_str):
         elif token == "[":
             if optional:
                 raise ParseException("Unbalanced optional bracket")
-            pdb.set_trace()
             optional = True
         elif token == "]":
             if not optional:
